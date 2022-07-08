@@ -1,10 +1,13 @@
-use std::result;
+use std::{ffi::OsString, time::Duration};
 
-use tokio::process::{Command, ChildStdin};
+use agent::Agent;
+use windows_service::{define_windows_service, service_control_handler::{self, ServiceControlHandlerResult}, service::{ServiceControl, ServiceType, ServiceState, ServiceControlAccept, ServiceExitCode}};
 
+mod agent;
 mod cli;
+mod service;
 
-struct CommandOptions {
+/*struct CommandOptions {
     command: CommandLine,
     input: Option<Vec<u8>>,
 }
@@ -57,22 +60,53 @@ struct CommandResult {
 
 async fn run_command(command: CommandOptions) {
     //let proc = tokio::process::Command::new(program)
+}*/
+
+define_windows_service!(ffi_service_main, win_service_main);
+
+fn win_service_main(_arguments: Vec<OsString>) {
+    // The entry point where execution will start on a background thread after a call to
+    // `service_dispatcher::start` from `main`.
+    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        match control_event {
+            ServiceControl::Stop => {
+                // Handle stop event and return control back to the system.
+                // TODO: Actually stop the agent, getting a handle to it and awaiting
+                //       the stop will probably require some unsafe nonsense :(
+                ServiceControlHandlerResult::NoError
+            }
+            // All services must accept Interrogate even if it's a no-op.
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+
+    // Register system service event handler
+    let status_handle = service_control_handler::register(Agent::SERVICE_NAME, event_handler);
+    match status_handle {
+        Ok(status_handle) => {
+            let next_status = windows_service::service::ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Running,
+                controls_accepted: ServiceControlAccept::STOP,
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            };
+            if let Err(err) = status_handle.set_service_status(next_status) {
+                log::error!("Failed to update service status to running: {}", err);
+            }
+        },
+
+        Err(err) => {
+            log::error!("Failed to register service control handler: {}", err);
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let result = cli::cli_main(None).await;
-
-    match result {
-        Ok(result) => {
-            if !result.success() {
-                log::error!("Error: {}", result)
-            }
-            std::process::exit(result.status());
-        },
-        Err(err) => {
-            log::error!("Unknwon error: {}", err);
-            std::process::exit(cli::PorceletCliStatus::UnknownError.status());
-        },
-    }
+    env_logger::Builder::from_default_env().filter_level(log::LevelFilter::Info).init();
+    cli::cli_main(None).await;
 }
