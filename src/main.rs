@@ -1,6 +1,7 @@
 use std::{ffi::OsString, time::Duration};
 
 use agent::Agent;
+use tokio::runtime::Runtime;
 use windows_service::{define_windows_service, service_control_handler::{self, ServiceControlHandlerResult}, service::{ServiceControl, ServiceType, ServiceState, ServiceControlAccept, ServiceExitCode}};
 
 mod agent;
@@ -67,12 +68,14 @@ define_windows_service!(ffi_service_main, win_service_main);
 fn win_service_main(_arguments: Vec<OsString>) {
     // The entry point where execution will start on a background thread after a call to
     // `service_dispatcher::start` from `main`.
+    let mut agent = Agent::new();
+    let shutdown_sender = agent.shutdown_sender();
+
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop => {
                 // Handle stop event and return control back to the system.
-                // TODO: Actually stop the agent, getting a handle to it and awaiting
-                //       the stop will probably require some unsafe nonsense :(
+                let _ = shutdown_sender.try_send(());
                 ServiceControlHandlerResult::NoError
             }
             // All services must accept Interrogate even if it's a no-op.
@@ -81,9 +84,9 @@ fn win_service_main(_arguments: Vec<OsString>) {
         }
     };
 
-    // Register system service event handler
+    // Register system service event handler and update service status to running.
     let status_handle = service_control_handler::register(Agent::SERVICE_NAME, event_handler);
-    match status_handle {
+    match &status_handle {
         Ok(status_handle) => {
             let next_status = windows_service::service::ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
@@ -103,10 +106,45 @@ fn win_service_main(_arguments: Vec<OsString>) {
             log::error!("Failed to register service control handler: {}", err);
         }
     }
+
+    // Create tokio runtime and start agent.
+    let mut exit_code = 0;
+
+    match Runtime::new() {
+        Ok(runtime) => {
+            let result = runtime.block_on(async move {
+                agent.run().await
+            });
+            if let Err(err) = result {
+                log::error!("Agent exited with an error: {}", err);
+                exit_code = 1;
+            }
+        },
+        Err(err) => {
+            log::error!("Failed to start tokio runtime: {}", err);
+            exit_code = 2;
+        }
+    }
+
+    // Update service status to stopped.
+    if let Ok(status_handle) = &status_handle {
+        let next_status = windows_service::service::ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(exit_code),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        };
+        if let Err(err) = status_handle.set_service_status(next_status) {
+            log::error!("Failed to update service status to stopped: {}", err);
+        }
+    }
+
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     env_logger::Builder::from_default_env().filter_level(log::LevelFilter::Info).init();
-    cli::cli_main(None).await;
+    cli::cli_main(None);
 }

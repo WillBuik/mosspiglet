@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 
 use clap::Parser;
+use tokio::runtime::Runtime;
 use windows_service::service_dispatcher;
 
 use crate::{service::{SystemService, ServiceStatus, ServiceDescription}, agent::Agent, ffi_service_main};
@@ -47,7 +48,7 @@ pub enum AgentSubcommand {
     RunWindowsService,
 }
 
-async fn agent_command(agent_subcommand: AgentSubcommand) -> anyhow::Result<()> {
+fn agent_command(agent_subcommand: AgentSubcommand) -> anyhow::Result<()> {
     let agent_service_manager = SystemService::new(Agent::SERVICE_NAME.into());
 
     match agent_subcommand {
@@ -79,14 +80,12 @@ async fn agent_command(agent_subcommand: AgentSubcommand) -> anyhow::Result<()> 
         },
 
         AgentSubcommand::Run => {
-            Agent::new().run().await?;
+            Runtime::new()?.block_on(async {
+                Agent::new().run().await
+            })?;
         },
 
         AgentSubcommand::RunWindowsService => {
-            tokio::spawn(async {
-                Agent::new().run().await?;
-                Ok::<(), anyhow::Error>(())
-            });
             service_dispatcher::start(&Agent::SERVICE_NAME, ffi_service_main)?;
         },
     }
@@ -128,12 +127,21 @@ async fn agent_status() -> anyhow::Result<()> {
 /// Porcelet CLI entry point.
 /// 
 /// If args is None, args are parsed from the command line.
-pub async fn cli_main(args: Option<CliArgs>) -> ! {
+pub fn cli_main(args: Option<CliArgs>) -> ! {
     let args = args.unwrap_or(CliArgs::parse());
 
     let result = match args.subcommand {
-        CliSubcommand::Agent { agent_subcommand } => agent_command(agent_subcommand).await,
-        CliSubcommand::Status => agent_status().await,
+        CliSubcommand::Agent { agent_subcommand } => agent_command(agent_subcommand),
+        CliSubcommand::Status => {
+            match Runtime::new() {
+                Ok(runtime) => {
+                    runtime.block_on(async {
+                        agent_status().await
+                    })
+                },
+                Err(err) => Err(anyhow::anyhow!(err)),
+            }
+        },
     };
 
     match result {
